@@ -7,7 +7,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const FILEMOON_URL = process.argv[2];
 const TASK_ID = process.argv[3]; // ID único vindo do HTML
-const STATUS_SERVER = 'https://livestream.ct.ws/M/status.php';
+const STATUS_SERVER = 'https://livestream.ct.ws/Api/status.php';
 const CRED_SERVER = 'https://livestream.ct.ws/M/upload.php';
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
