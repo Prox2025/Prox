@@ -1,4 +1,4 @@
-name: Processar vídeo e enviar
+name: Upload vídeo para Google Drive ou Download Local
 
 on:
   workflow_dispatch:
@@ -8,63 +8,53 @@ on:
         required: true
         type: string
       start_time:
-        description: 'Tempo de início (opcional, ex: 00:01:00)'
+        description: 'Tempo de início (formato HH:MM:SS)'
         required: false
         type: string
       end_time:
-        description: 'Tempo final (opcional, ex: 00:03:00)'
+        description: 'Tempo final (formato HH:MM:SS)'
         required: false
         type: string
       destino:
-        description: 'Onde salvar o vídeo'
-        required: true
+        description: 'Onde salvar o vídeo (drive ou local)'
+        required: false
+        default: 'drive'
         type: choice
         options:
           - drive
           - local
 
 jobs:
-  processar:
+  processar-video:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout do repositório
+      - name: 📦 Checkout do código
         uses: actions/checkout@v3
 
-      - name: Cache do Node.js + Puppeteer
-        uses: actions/cache@v3
+      - name: 💾 Cache de dependências
+        uses: actions/cache@v4
         with:
           path: ~/.npm
           key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-node-
 
-      - name: Cache do yt-dlp
-        id: yt-dlp-cache
-        uses: actions/cache@v3
-        with:
-          path: /usr/local/bin/yt-dlp
-          key: yt-dlp-cache-v1
-
-      - name: Instalar dependências
+      - name: 🛠️ Instalar dependências
         run: |
           sudo apt update
           sudo apt install -y ffmpeg curl
           curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
           sudo apt install -y nodejs
-          npm install puppeteer
-          if [ ! -f /usr/local/bin/yt-dlp ]; then
-            sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-            sudo chmod a+rx /usr/local/bin/yt-dlp
-          fi
+          npm install puppeteer ytdl-core
 
-      - name: Executar script de processamento
+      - name: 🚀 Executar script de processamento
         run: |
           node filemoon-upload-to-gdrive.js "${{ github.event.inputs.file_url }}" "${{ github.event.inputs.start_time }}" "${{ github.event.inputs.end_time }}" "${{ github.event.inputs.destino }}"
 
-      - name: Upload como artefato (se destino = local)
+      - name: 📤 Upload do vídeo (se destino for local)
         if: ${{ github.event.inputs.destino == 'local' }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: video-processado
-          path: final.mp4
+          path: ./video_final.mp4
