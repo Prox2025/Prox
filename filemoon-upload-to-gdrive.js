@@ -13,7 +13,6 @@ const DESTINO = process.argv[5] || 'drive';
 const SERVER_URL = 'https://livestream.ct.ws/M/upload.php';
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-// Obter credenciais
 async function getGoogleDriveCredentials() {
   const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
   const page = await browser.newPage();
@@ -27,12 +26,10 @@ async function getGoogleDriveCredentials() {
   return json;
 }
 
-// Verifica se link é YouTube ou Facebook
 function isYtOrFb(url) {
   return url.includes('facebook.com') || url.includes('youtube.com') || url.includes('youtu.be');
 }
 
-// Baixa usando yt-dlp
 function downloadFromYtOrFb(url, outputPath) {
   console.log('📥 Baixando de YouTube/Facebook...');
   const args = ['-f', 'best[ext=mp4]', url, '-o', outputPath];
@@ -40,7 +37,6 @@ function downloadFromYtOrFb(url, outputPath) {
   if (result.status !== 0) throw new Error('Erro no yt-dlp');
 }
 
-// Pega link direto da Filemoon
 async function getVideoUrlFromFilemoon(url) {
   const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
   const page = await browser.newPage();
@@ -76,7 +72,6 @@ async function getVideoUrlFromFilemoon(url) {
   return videoUrls[0];
 }
 
-// Gera token JWT
 async function generateGoogleDriveToken(chave) {
   const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
   const now = Math.floor(Date.now() / 1000);
@@ -118,18 +113,18 @@ async function generateGoogleDriveToken(chave) {
   });
 }
 
-// Reencoda e redimensiona para 340p
+// 🔧 Atualizada para compressão máxima com resolução 340
 function reencode(input, output) {
   const args = ['-i', input];
   if (START_TIME) args.push('-ss', START_TIME);
   if (END_TIME) args.push('-to', END_TIME);
   args.push(
-    '-vf', 'scale=-2:340',
+    '-vf', 'scale=-2:340',     // resolução 340p
     '-c:v', 'libx264',
-    '-preset', 'fast',
-    '-b:v', '1200k',
+    '-preset', 'slow',         // compressão eficiente
+    '-crf', '28',              // controle de qualidade/tamanho
     '-c:a', 'aac',
-    '-b:a', '128k',
+    '-b:a', '64k',             // áudio mais comprimido
     '-y',
     output
   );
@@ -137,7 +132,6 @@ function reencode(input, output) {
   if (result.status !== 0) throw new Error('Erro ao reencodar vídeo.');
 }
 
-// Upload resumido para Google Drive
 async function uploadToDrive(path, nome, token, folderId) {
   const meta = JSON.stringify({ name: nome, parents: [folderId] });
   const uploadUrl = await new Promise((resolve, reject) => {
@@ -183,14 +177,13 @@ async function uploadToDrive(path, nome, token, folderId) {
   fs.closeSync(fd);
 }
 
-// Execução principal
 (async () => {
   try {
     if (!VIDEO_URL) throw new Error('Informe o link do vídeo.');
     const { chave, pastaDriveId } = await getGoogleDriveCredentials();
 
     const original = path.join(__dirname, 'original.mp4');
-    const final = path.join(__dirname, 'final.mp4');
+    const final = path.join(__dirname, 'video_final.mp4');
 
     if (isYtOrFb(VIDEO_URL)) {
       downloadFromYtOrFb(VIDEO_URL, original);
@@ -207,7 +200,7 @@ async function uploadToDrive(path, nome, token, folderId) {
       await uploadToDrive(final, `video_${Date.now()}.mp4`, token, pastaDriveId);
       console.log('✅ Enviado ao Google Drive com sucesso!');
     } else {
-      console.log('📁 Vídeo processado salvo localmente como final.mp4');
+      console.log('📁 Vídeo processado salvo como video_final.mp4');
     }
 
     fs.unlinkSync(original);
