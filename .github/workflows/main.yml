@@ -1,22 +1,22 @@
-name: Upload vídeo para Google Drive ou Download Local
+name: Upload Filemoon/YouTube/Facebook para Google Drive
 
 on:
   workflow_dispatch:
     inputs:
-      file_url:
-        description: 'Link do vídeo (Filemoon, Facebook ou YouTube)'
+      video_url:
+        description: 'Link do vídeo (Filemoon, YouTube, Facebook)'
         required: true
         type: string
       start_time:
-        description: 'Tempo de início (formato HH:MM:SS)'
+        description: 'Tempo de início (ex: 00:00:05)'
         required: false
         type: string
       end_time:
-        description: 'Tempo final (formato HH:MM:SS)'
+        description: 'Tempo final (ex: 00:01:00)'
         required: false
         type: string
       destino:
-        description: 'Onde salvar o vídeo (drive ou local)'
+        description: 'Onde salvar (drive ou local)'
         required: false
         default: 'drive'
         type: choice
@@ -25,36 +25,34 @@ on:
           - local
 
 jobs:
-  processar-video:
+  process_video:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📦 Checkout do código
+      - name: 🔄 Checkout do código
         uses: actions/checkout@v3
 
-      - name: 💾 Cache de dependências
-        uses: actions/cache@v4
+      - name: 💾 Cache do Node.js
+        uses: actions/cache@v3
         with:
           path: ~/.npm
           key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-node-
 
-      - name: 🛠️ Instalar dependências
+      - name: ⚙️ Instalar dependências (ffmpeg, yt-dlp, nodejs)
         run: |
           sudo apt update
-          sudo apt install -y ffmpeg curl
+          sudo apt install -y ffmpeg python3-pip
+          pip install -U yt-dlp
           curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
           sudo apt install -y nodejs
-          npm install puppeteer ytdl-core
+          npm install puppeteer
 
-      - name: 🚀 Executar script de processamento
+      - name: 🚀 Executar script de upload
         run: |
-          node filemoon-upload-to-gdrive.js "${{ github.event.inputs.file_url }}" "${{ github.event.inputs.start_time }}" "${{ github.event.inputs.end_time }}" "${{ github.event.inputs.destino }}"
-
-      - name: 📤 Upload do vídeo (se destino for local)
-        if: ${{ github.event.inputs.destino == 'local' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: video-processado
-          path: ./video_final.mp4
+          node filemoon-upload-to-gdrive.js \
+            "${{ github.event.inputs.video_url }}" \
+            "${{ github.event.inputs.start_time || '00:00:00' }}" \
+            "${{ github.event.inputs.end_time || '00:00:00' }}" \
+            "${{ github.event.inputs.destino || 'drive' }}"
