@@ -116,16 +116,16 @@ async function generateGoogleDriveToken(chave) {
   });
 }
 
-// Reencoda para 340p com corte opcional
+// Reencoda para 240p com corte opcional
 function reencode(input, output) {
   const args = ['-i', input];
   if (START_TIME && START_TIME !== '00:00:00') args.push('-ss', START_TIME);
   if (END_TIME && END_TIME !== '00:00:00' && END_TIME !== START_TIME) args.push('-to', END_TIME);
   args.push(
-    '-vf', 'scale=-2:340',
+    '-vf', 'scale=-2:240',
     '-c:v', 'libx264',
     '-preset', 'fast',
-    '-b:v', '900k',
+    '-b:v', '500k',
     '-c:a', 'aac',
     '-b:a', '64k',
     '-y',
@@ -203,13 +203,14 @@ async function uploadToDrive(filePath, nome, token, folderId) {
 
     if (DESTINO === 'drive') {
       const token = await generateGoogleDriveToken(chave);
-      await uploadToDrive(final, `video_${Date.now()}.mp4`, token, pastaDriveId);
+      await uploadToDrive(final, `video_240p_${Date.now()}.mp4`, token, pastaDriveId);
       console.log('✅ Enviado ao Google Drive com sucesso!');
     } else {
       console.log('📁 Vídeo processado salvo localmente como final.mp4');
     }
 
     fs.unlinkSync(original);
+    fs.unlinkSync(final);
   } catch (e) {
     console.error('❌ Erro:', e.message || e);
   }
