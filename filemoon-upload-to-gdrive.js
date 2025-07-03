@@ -13,7 +13,6 @@ const DESTINO = process.argv[5] || 'drive';
 const SERVER_URL = 'https://livestream.ct.ws/M/upload.php';
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-// Obtém as credenciais e pasta do servidor
 async function getGoogleDriveCredentials() {
   const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
   const page = await browser.newPage();
@@ -35,10 +34,7 @@ function downloadFromYtOrFb(url, outputPath) {
   console.log('📥 Baixando de YouTube/Facebook...');
   const args = ['-f', 'best[ext=mp4]', url, '-o', outputPath];
   const result = spawnSync('yt-dlp', args, { stdio: 'inherit' });
-  if (result.status !== 0) {
-    console.error('🔍 yt-dlp falhou. Verifique se o vídeo é público.');
-    throw new Error('Erro no yt-dlp');
-  }
+  if (result.status !== 0) throw new Error('Erro no yt-dlp');
 }
 
 async function getVideoUrlFromFilemoon(url) {
@@ -118,8 +114,9 @@ async function generateGoogleDriveToken(chave) {
 }
 
 function reencode(input, output) {
-  const args = ['-i', input];
+  const args = [];
   if (START_TIME && START_TIME !== '00:00:00') args.push('-ss', START_TIME);
+  args.push('-i', input);
   if (END_TIME && END_TIME !== '00:00:00' && END_TIME !== START_TIME) args.push('-to', END_TIME);
   args.push(
     '-vf', 'scale=-2:240',
@@ -135,7 +132,6 @@ function reencode(input, output) {
   if (result.status !== 0) throw new Error('Erro ao reencodar vídeo.');
 }
 
-// NOVA função para gerar a URL de upload
 async function criarUploadUrl(token, nome, folderId) {
   const meta = JSON.stringify({ name: nome, parents: [folderId] });
   return new Promise((resolve, reject) => {
@@ -147,38 +143,34 @@ async function criarUploadUrl(token, nome, folderId) {
         'Content-Length': Buffer.byteLength(meta)
       }
     }, res => {
-      if (![200, 201].includes(res.statusCode)) {
-        reject(new Error(`Erro ao iniciar upload resumido. Status: ${res.statusCode}`));
-      } else {
-        resolve(res.headers.location);
-      }
+      if (![200, 201].includes(res.statusCode)) reject(new Error(`Erro ao iniciar upload. Código: ${res.statusCode}`));
+      else resolve(res.headers.location);
     });
     req.on('error', reject);
     req.write(meta); req.end();
   });
 }
 
-async function uploadToDrive(filePath, nome, token, folderId, chave) {
-  let tokenAtual = token;
-  let uploadUrl = await criarUploadUrl(tokenAtual, nome, folderId);
-
+async function uploadToDrive(filePath, nome, tokenInicial, folderId, chave) {
   const CHUNK = 256 * 1024 * 1024;
   const size = fs.statSync(filePath).size;
   const fd = fs.openSync(filePath, 'r');
   let offset = 0;
+
+  let tokenAtual = tokenInicial;
+  let uploadUrl = await criarUploadUrl(tokenAtual, nome, folderId);
 
   while (offset < size) {
     const chunkSize = Math.min(CHUNK, size - offset);
     const buffer = Buffer.alloc(chunkSize);
     fs.readSync(fd, buffer, 0, chunkSize, offset);
 
-    let success = false;
     let attempts = 0;
+    let sucesso = false;
 
-    while (!success && attempts < 3) {
+    while (!sucesso && attempts < 3) {
       try {
         console.log(`📤 Enviando pedaço: ${offset}-${offset + chunkSize - 1}/${size} (Tentativa ${attempts + 1})`);
-
         await new Promise((resolve, reject) => {
           const req = https.request(uploadUrl, {
             method: 'PUT',
@@ -189,37 +181,31 @@ async function uploadToDrive(filePath, nome, token, folderId, chave) {
             }
           }, res => {
             if ([200, 201, 308].includes(res.statusCode)) resolve();
-            else if ([401, 403].includes(res.statusCode)) {
-              reject(new Error(`Token expirado ou inválido (HTTP ${res.statusCode})`));
-            } else {
-              reject(new Error(`Erro HTTP ${res.statusCode}`));
-            }
+            else reject(new Error(`HTTP ${res.statusCode}`));
           });
           req.on('error', reject);
           req.write(buffer); req.end();
         });
-
-        success = true;
+        sucesso = true;
       } catch (err) {
-        console.warn(`⚠️ Falha ao enviar chunk: ${err.message}`);
+        console.warn(`⚠️ Erro ao enviar chunk: ${err.message}`);
         attempts++;
-        if (err.message.includes('Token expirado') && attempts < 3) {
-          console.log('🔄 Renovando token e URL...');
+        if (attempts < 3 && err.message.includes('401') || err.message.includes('403')) {
+          console.log('🔄 Renovando token e URL de upload...');
           tokenAtual = await generateGoogleDriveToken(chave);
           uploadUrl = await criarUploadUrl(tokenAtual, nome, folderId);
         }
-        if (attempts >= 3) throw new Error('Erro ao enviar chunk após 3 tentativas.');
         await delay(2000);
       }
     }
 
+    if (!sucesso) throw new Error('❌ Erro: Falha após 3 tentativas de envio do chunk.');
     offset += chunkSize;
   }
 
   fs.closeSync(fd);
 }
 
-// EXECUÇÃO PRINCIPAL
 (async () => {
   try {
     if (!VIDEO_URL) throw new Error('Informe o link do vídeo.');
@@ -241,11 +227,11 @@ async function uploadToDrive(filePath, nome, token, folderId, chave) {
     reencode(original, final);
 
     if (DESTINO === 'drive') {
-      let token = await generateGoogleDriveToken(chave);
+      const token = await generateGoogleDriveToken(chave);
       await uploadToDrive(final, `video_240p_${Date.now()}.mp4`, token, pastaDriveId, chave);
       console.log('✅ Enviado ao Google Drive com sucesso!');
     } else {
-      console.log('📁 Vídeo processado salvo localmente como final.mp4');
+      console.log('📁 Vídeo final salvo localmente como final.mp4');
     }
 
     if (fs.existsSync(original)) fs.unlinkSync(original);
