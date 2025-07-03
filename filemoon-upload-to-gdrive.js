@@ -116,7 +116,6 @@ async function generateGoogleDriveToken(chave) {
   });
 }
 
-// Reencoda para 240p com corte opcional
 function reencode(input, output) {
   const args = ['-i', input];
   if (START_TIME && START_TIME !== '00:00:00') args.push('-ss', START_TIME);
@@ -135,9 +134,10 @@ function reencode(input, output) {
   if (result.status !== 0) throw new Error('Erro ao reencodar vídeo.');
 }
 
-async function uploadToDrive(filePath, nome, token, folderId) {
+async function uploadToDrive(filePath, nome, token, folderId, chave) {
   const meta = JSON.stringify({ name: nome, parents: [folderId] });
-  const uploadUrl = await new Promise((resolve, reject) => {
+
+  let uploadUrl = await new Promise((resolve, reject) => {
     const req = https.request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
       method: 'POST',
       headers: {
@@ -146,8 +146,11 @@ async function uploadToDrive(filePath, nome, token, folderId) {
         'Content-Length': Buffer.byteLength(meta)
       }
     }, res => {
-      if (![200, 201].includes(res.statusCode)) reject(new Error('Erro no upload resumido'));
-      else resolve(res.headers.location);
+      if (![200, 201].includes(res.statusCode)) {
+        reject(new Error(`Erro ao iniciar upload resumido. Status: ${res.statusCode}`));
+      } else {
+        resolve(res.headers.location);
+      }
     });
     req.on('error', reject);
     req.write(meta); req.end();
@@ -157,27 +160,75 @@ async function uploadToDrive(filePath, nome, token, folderId) {
   const size = fs.statSync(filePath).size;
   const fd = fs.openSync(filePath, 'r');
   let offset = 0;
+
   while (offset < size) {
     const chunkSize = Math.min(CHUNK, size - offset);
     const buffer = Buffer.alloc(chunkSize);
     fs.readSync(fd, buffer, 0, chunkSize, offset);
-    await new Promise((resolve, reject) => {
-      const req = https.request(uploadUrl, {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Length': chunkSize,
-          'Content-Range': `bytes ${offset}-${offset + chunkSize - 1}/${size}`
+
+    let success = false;
+    let attempts = 0;
+
+    while (!success && attempts < 3) {
+      try {
+        console.log(`📤 Enviando chunk: ${offset}-${offset + chunkSize - 1}/${size} (Tentativa ${attempts + 1})`);
+
+        await new Promise((resolve, reject) => {
+          const req = https.request(uploadUrl, {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Length': chunkSize,
+              'Content-Range': `bytes ${offset}-${offset + chunkSize - 1}/${size}`
+            }
+          }, res => {
+            if ([200, 201, 308].includes(res.statusCode)) {
+              resolve();
+            } else if ([401, 403].includes(res.statusCode)) {
+              reject(new Error(`Token expirado ou inválido (HTTP ${res.statusCode})`));
+            } else {
+              reject(new Error(`Erro HTTP ${res.statusCode}`));
+            }
+          });
+
+          req.on('error', reject);
+          req.write(buffer); req.end();
+        });
+
+        success = true;
+      } catch (err) {
+        console.warn(`⚠️ Falha ao enviar chunk: ${err.message}`);
+        attempts++;
+        if (err.message.includes('Token expirado') && attempts < 3) {
+          console.log('🔄 Renovando token...');
+          token = await generateGoogleDriveToken(chave);
+          uploadUrl = await new Promise((resolve, reject) => {
+            const req = https.request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json; charset=UTF-8',
+                'Content-Length': Buffer.byteLength(meta)
+              }
+            }, res => {
+              if (![200, 201].includes(res.statusCode)) {
+                reject(new Error(`Erro ao reiniciar upload resumido. Status: ${res.statusCode}`));
+              } else {
+                resolve(res.headers.location);
+              }
+            });
+            req.on('error', reject);
+            req.write(meta); req.end();
+          });
         }
-      }, res => {
-        if ([200, 201, 308].includes(res.statusCode)) resolve();
-        else reject(new Error('Erro ao enviar chunk'));
-      });
-      req.on('error', reject);
-      req.write(buffer); req.end();
-    });
+        if (attempts >= 3) throw new Error('Erro ao enviar chunk após 3 tentativas.');
+        await delay(2000);
+      }
+    }
+
     offset += chunkSize;
   }
+
   fs.closeSync(fd);
 }
 
@@ -194,7 +245,7 @@ async function uploadToDrive(filePath, nome, token, folderId) {
       downloadFromYtOrFb(VIDEO_URL, original);
     } else {
       const videoUrl = await getVideoUrlFromFilemoon(VIDEO_URL);
-      spawnSync('ffmpeg', ['-i', videoUrl, '-c', 'copy', '-y', original], { stdio: 'inherit' });
+      spawnSync('ffmpeg', ['-i', videoUrl, '-c:v', 'libx264', '-c:a', 'aac', '-y', original], { stdio: 'inherit' });
     }
 
     if (!fs.existsSync(original)) throw new Error('Erro ao baixar vídeo.');
@@ -202,15 +253,15 @@ async function uploadToDrive(filePath, nome, token, folderId) {
     reencode(original, final);
 
     if (DESTINO === 'drive') {
-      const token = await generateGoogleDriveToken(chave);
-      await uploadToDrive(final, `video_240p_${Date.now()}.mp4`, token, pastaDriveId);
+      let token = await generateGoogleDriveToken(chave);
+      await uploadToDrive(final, `video_240p_${Date.now()}.mp4`, token, pastaDriveId, chave);
       console.log('✅ Enviado ao Google Drive com sucesso!');
     } else {
       console.log('📁 Vídeo processado salvo localmente como final.mp4');
     }
 
-    fs.unlinkSync(original);
-    fs.unlinkSync(final);
+    if (fs.existsSync(original)) fs.unlinkSync(original);
+    if (fs.existsSync(final)) fs.unlinkSync(final);
   } catch (e) {
     console.error('❌ Erro:', e.message || e);
   }
