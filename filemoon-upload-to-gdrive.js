@@ -22,7 +22,14 @@ async function getGoogleDriveCredentials() {
     try { return JSON.parse(document.body.innerText); } catch { return null; }
   });
   await browser.close();
-  if (!json || !json.chave || !json.pastaDriveId) throw new Error('Credenciais inválidas');
+
+  // ✅ Exibe os dados retornados do servidor
+  if (json) {
+    console.log('📡 Dados recebidos do servidor:');
+    console.log(JSON.stringify(json, null, 2));
+  }
+
+  if (!json || !json.chave || !json.pastaDriveId) throw new Error('❌ Credenciais inválidas');
   return json;
 }
 
@@ -39,10 +46,7 @@ function downloadFromYtOrFb(url, outputPath) {
   console.log('📥 Baixando de YouTube/Facebook...');
   const args = ['-f', 'best[ext=mp4]', url, '-o', outputPath];
   const result = spawnSync('yt-dlp', args, { stdio: 'inherit' });
-  if (result.status !== 0) {
-    console.error('🔍 yt-dlp falhou. Verifique se o vídeo é público ou se os cookies estão corretos.');
-    throw new Error('Erro no yt-dlp');
-  }
+  if (result.status !== 0) throw new Error('Erro no yt-dlp');
 }
 
 async function getVideoUrlFromFilemoon(url) {
@@ -123,8 +127,7 @@ async function generateGoogleDriveToken(chave) {
 
 function reencode(input, output) {
   const args = ['-i', input];
-  // Só adiciona corte se definido e diferente de '00:00:00' e start != end
-  if (START_TIME && START_TIME !== '00:00:00' && END_TIME && END_TIME !== '00:00:00' && START_TIME !== END_TIME) {
+  if (START_TIME && END_TIME && START_TIME !== END_TIME && START_TIME !== '00:00:00') {
     args.push('-ss', START_TIME, '-to', END_TIME);
   }
   args.push(
@@ -169,7 +172,7 @@ async function uploadToDrive(filePath, nome, chave, pastaDriveId) {
 
   async function getFileMetadata(fileId) {
     return new Promise((resolve, reject) => {
-      const req = https.request(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,mimeType,size,parents,webViewLink`, {
+      const req = https.request(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,size,webViewLink`, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -200,7 +203,6 @@ async function uploadToDrive(filePath, nome, chave, pastaDriveId) {
   }
 
   let uploadUrl = await getUploadUrl();
-
   const CHUNK = 256 * 1024 * 1024;
   const size = fs.statSync(filePath).size;
   const fd = fs.openSync(filePath, 'r');
@@ -224,13 +226,9 @@ async function uploadToDrive(filePath, nome, chave, pastaDriveId) {
               'Content-Range': `bytes ${offset}-${offset + chunkSize - 1}/${size}`
             }
           }, res => {
-            if ([200, 201, 308].includes(res.statusCode)) {
-              resolve();
-            } else if (res.statusCode === 403) {
-              reject(new Error('403'));
-            } else {
-              reject(new Error(`Erro ao enviar chunk: ${res.statusCode}`));
-            }
+            if ([200, 201, 308].includes(res.statusCode)) resolve();
+            else if (res.statusCode === 403) reject(new Error('403'));
+            else reject(new Error(`Erro ao enviar chunk: ${res.statusCode}`));
           });
           req.on('error', reject);
           req.write(buffer);
@@ -239,7 +237,7 @@ async function uploadToDrive(filePath, nome, chave, pastaDriveId) {
         break;
       } catch (err) {
         if (err.message === '403') {
-          console.warn('⚠️ Token expirado ou inválido. Renovando token e URL de upload...');
+          console.warn('🔄 Renovando token e URL de upload...');
           token = await generateGoogleDriveToken(chave);
           uploadUrl = await getUploadUrl();
           attempt++;
@@ -248,36 +246,28 @@ async function uploadToDrive(filePath, nome, chave, pastaDriveId) {
         }
       }
     }
-    if (attempt === 3) {
-      throw new Error('❌ Falha após 3 tentativas de envio do chunk.');
-    }
+    if (attempt === 3) throw new Error('❌ Falha após 3 tentativas de envio do chunk.');
     offset += chunkSize;
   }
+
   fs.closeSync(fd);
 
   const fileId = extractFileId(uploadUrl);
   if (fileId) {
-    console.log('🔍 Obtendo metadados do arquivo enviado...');
-    try {
-      const metadata = await getFileMetadata(fileId);
-      console.log('✅ Arquivo enviado com sucesso. Metadados:');
-      console.log(JSON.stringify(metadata, null, 2));
-    } catch (err) {
-      console.warn('⚠️ Falha ao obter metadados:', err.message);
-    }
+    const metadata = await getFileMetadata(fileId);
+    console.log('✅ Arquivo enviado com sucesso! Metadados:');
+    console.log(JSON.stringify(metadata, null, 2));
   } else {
-    console.warn('⚠️ Não foi possível extrair fileId da URL de upload para obter metadados.');
+    console.warn('⚠️ Não foi possível extrair fileId para metadados.');
   }
 }
 
 (async () => {
   try {
     if (!VIDEO_URL_RAW) throw new Error('Informe o link do vídeo.');
-
     const { chave, pastaDriveId } = await getGoogleDriveCredentials();
 
     const VIDEO_URL = normalizeUrl(VIDEO_URL_RAW);
-
     const original = path.join(__dirname, 'original.mp4');
     const final = path.join(__dirname, 'final.mp4');
 
@@ -289,14 +279,12 @@ async function uploadToDrive(filePath, nome, chave, pastaDriveId) {
     }
 
     if (!fs.existsSync(original)) throw new Error('Erro ao baixar vídeo.');
-
     reencode(original, final);
 
     if (DESTINO === 'drive') {
       await uploadToDrive(final, `video_240p_${Date.now()}.mp4`, chave, pastaDriveId);
-      console.log('✅ Enviado ao Google Drive com sucesso!');
     } else {
-      console.log('📁 Vídeo processado salvo localmente como final.mp4');
+      console.log('📁 Vídeo salvo localmente como final.mp4');
     }
 
     fs.unlinkSync(original);
