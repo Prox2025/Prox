@@ -5,7 +5,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
-const VIDEO_URL = process.argv[2];
+const VIDEO_URL_RAW = process.argv[2];
 const START_TIME = process.argv[3] || null;
 const END_TIME = process.argv[4] || null;
 const DESTINO = process.argv[5] || 'drive';
@@ -26,6 +26,11 @@ async function getGoogleDriveCredentials() {
   return json;
 }
 
+function normalizeUrl(url) {
+  if (!url) return url;
+  return url.replace('m.youtube.com', 'www.youtube.com');
+}
+
 function isYtOrFb(url) {
   return url.includes('facebook.com') || url.includes('youtube.com') || url.includes('youtu.be');
 }
@@ -34,7 +39,10 @@ function downloadFromYtOrFb(url, outputPath) {
   console.log('📥 Baixando de YouTube/Facebook...');
   const args = ['-f', 'best[ext=mp4]', url, '-o', outputPath];
   const result = spawnSync('yt-dlp', args, { stdio: 'inherit' });
-  if (result.status !== 0) throw new Error('Erro no yt-dlp');
+  if (result.status !== 0) {
+    console.error('🔍 yt-dlp falhou. Verifique se o vídeo é público ou se os cookies estão corretos.');
+    throw new Error('Erro no yt-dlp');
+  }
 }
 
 async function getVideoUrlFromFilemoon(url) {
@@ -114,10 +122,11 @@ async function generateGoogleDriveToken(chave) {
 }
 
 function reencode(input, output) {
-  const args = [];
-  if (START_TIME && START_TIME !== '00:00:00') args.push('-ss', START_TIME);
-  args.push('-i', input);
-  if (END_TIME && END_TIME !== '00:00:00' && END_TIME !== START_TIME) args.push('-to', END_TIME);
+  const args = ['-i', input];
+  // Só adiciona corte se definido e diferente de '00:00:00' e start != end
+  if (START_TIME && START_TIME !== '00:00:00' && END_TIME && END_TIME !== '00:00:00' && START_TIME !== END_TIME) {
+    args.push('-ss', START_TIME, '-to', END_TIME);
+  }
   args.push(
     '-vf', 'scale=-2:240',
     '-c:v', 'libx264',
@@ -132,85 +141,142 @@ function reencode(input, output) {
   if (result.status !== 0) throw new Error('Erro ao reencodar vídeo.');
 }
 
-async function criarUploadUrl(token, nome, folderId) {
-  const meta = JSON.stringify({ name: nome, parents: [folderId] });
-  return new Promise((resolve, reject) => {
-    const req = https.request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json; charset=UTF-8',
-        'Content-Length': Buffer.byteLength(meta)
-      }
-    }, res => {
-      if (![200, 201].includes(res.statusCode)) reject(new Error(`Erro ao iniciar upload. Código: ${res.statusCode}`));
-      else resolve(res.headers.location);
-    });
-    req.on('error', reject);
-    req.write(meta); req.end();
-  });
-}
+async function uploadToDrive(filePath, nome, chave, pastaDriveId) {
+  let token = await generateGoogleDriveToken(chave);
 
-async function uploadToDrive(filePath, nome, tokenInicial, folderId, chave) {
+  async function getUploadUrl() {
+    const meta = JSON.stringify({ name: nome, parents: [pastaDriveId] });
+    return new Promise((resolve, reject) => {
+      const req = https.request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json; charset=UTF-8',
+          'Content-Length': Buffer.byteLength(meta),
+        }
+      }, res => {
+        if ([200, 201].includes(res.statusCode)) {
+          resolve(res.headers.location);
+        } else {
+          reject(new Error(`Erro no upload resumido: ${res.statusCode}`));
+        }
+      });
+      req.on('error', reject);
+      req.write(meta);
+      req.end();
+    });
+  }
+
+  async function getFileMetadata(fileId) {
+    return new Promise((resolve, reject) => {
+      const req = https.request(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,mimeType,size,parents,webViewLink`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        }
+      }, res => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          if ([200, 201].includes(res.statusCode)) {
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              reject(new Error('Erro ao parsear metadados do arquivo'));
+            }
+          } else {
+            reject(new Error(`Erro ao obter metadados do arquivo: ${res.statusCode}`));
+          }
+        });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  function extractFileId(uploadUrl) {
+    const match = uploadUrl.match(/\/files\/([a-zA-Z0-9_-]+)\?/);
+    return match ? match[1] : null;
+  }
+
+  let uploadUrl = await getUploadUrl();
+
   const CHUNK = 256 * 1024 * 1024;
   const size = fs.statSync(filePath).size;
   const fd = fs.openSync(filePath, 'r');
-  let offset = 0;
 
-  let tokenAtual = tokenInicial;
-  let uploadUrl = await criarUploadUrl(tokenAtual, nome, folderId);
+  let offset = 0;
 
   while (offset < size) {
     const chunkSize = Math.min(CHUNK, size - offset);
     const buffer = Buffer.alloc(chunkSize);
     fs.readSync(fd, buffer, 0, chunkSize, offset);
 
-    let attempts = 0;
-    let sucesso = false;
-
-    while (!sucesso && attempts < 3) {
+    let attempt = 0;
+    while (attempt < 3) {
       try {
-        console.log(`📤 Enviando pedaço: ${offset}-${offset + chunkSize - 1}/${size} (Tentativa ${attempts + 1})`);
         await new Promise((resolve, reject) => {
           const req = https.request(uploadUrl, {
             method: 'PUT',
             headers: {
-              'Authorization': `Bearer ${tokenAtual}`,
+              'Authorization': `Bearer ${token}`,
               'Content-Length': chunkSize,
               'Content-Range': `bytes ${offset}-${offset + chunkSize - 1}/${size}`
             }
           }, res => {
-            if ([200, 201, 308].includes(res.statusCode)) resolve();
-            else reject(new Error(`HTTP ${res.statusCode}`));
+            if ([200, 201, 308].includes(res.statusCode)) {
+              resolve();
+            } else if (res.statusCode === 403) {
+              reject(new Error('403'));
+            } else {
+              reject(new Error(`Erro ao enviar chunk: ${res.statusCode}`));
+            }
           });
           req.on('error', reject);
-          req.write(buffer); req.end();
+          req.write(buffer);
+          req.end();
         });
-        sucesso = true;
+        break;
       } catch (err) {
-        console.warn(`⚠️ Erro ao enviar chunk: ${err.message}`);
-        attempts++;
-        if (attempts < 3 && err.message.includes('401') || err.message.includes('403')) {
-          console.log('🔄 Renovando token e URL de upload...');
-          tokenAtual = await generateGoogleDriveToken(chave);
-          uploadUrl = await criarUploadUrl(tokenAtual, nome, folderId);
+        if (err.message === '403') {
+          console.warn('⚠️ Token expirado ou inválido. Renovando token e URL de upload...');
+          token = await generateGoogleDriveToken(chave);
+          uploadUrl = await getUploadUrl();
+          attempt++;
+        } else {
+          throw err;
         }
-        await delay(2000);
       }
     }
-
-    if (!sucesso) throw new Error('❌ Erro: Falha após 3 tentativas de envio do chunk.');
+    if (attempt === 3) {
+      throw new Error('❌ Falha após 3 tentativas de envio do chunk.');
+    }
     offset += chunkSize;
   }
-
   fs.closeSync(fd);
+
+  const fileId = extractFileId(uploadUrl);
+  if (fileId) {
+    console.log('🔍 Obtendo metadados do arquivo enviado...');
+    try {
+      const metadata = await getFileMetadata(fileId);
+      console.log('✅ Arquivo enviado com sucesso. Metadados:');
+      console.log(JSON.stringify(metadata, null, 2));
+    } catch (err) {
+      console.warn('⚠️ Falha ao obter metadados:', err.message);
+    }
+  } else {
+    console.warn('⚠️ Não foi possível extrair fileId da URL de upload para obter metadados.');
+  }
 }
 
 (async () => {
   try {
-    if (!VIDEO_URL) throw new Error('Informe o link do vídeo.');
+    if (!VIDEO_URL_RAW) throw new Error('Informe o link do vídeo.');
 
     const { chave, pastaDriveId } = await getGoogleDriveCredentials();
+
+    const VIDEO_URL = normalizeUrl(VIDEO_URL_RAW);
 
     const original = path.join(__dirname, 'original.mp4');
     const final = path.join(__dirname, 'final.mp4');
@@ -219,7 +285,7 @@ async function uploadToDrive(filePath, nome, tokenInicial, folderId, chave) {
       downloadFromYtOrFb(VIDEO_URL, original);
     } else {
       const videoUrl = await getVideoUrlFromFilemoon(VIDEO_URL);
-      spawnSync('ffmpeg', ['-i', videoUrl, '-c:v', 'libx264', '-c:a', 'aac', '-y', original], { stdio: 'inherit' });
+      spawnSync('ffmpeg', ['-i', videoUrl, '-c', 'copy', '-y', original], { stdio: 'inherit' });
     }
 
     if (!fs.existsSync(original)) throw new Error('Erro ao baixar vídeo.');
@@ -227,15 +293,14 @@ async function uploadToDrive(filePath, nome, tokenInicial, folderId, chave) {
     reencode(original, final);
 
     if (DESTINO === 'drive') {
-      const token = await generateGoogleDriveToken(chave);
-      await uploadToDrive(final, `video_240p_${Date.now()}.mp4`, token, pastaDriveId, chave);
+      await uploadToDrive(final, `video_240p_${Date.now()}.mp4`, chave, pastaDriveId);
       console.log('✅ Enviado ao Google Drive com sucesso!');
     } else {
-      console.log('📁 Vídeo final salvo localmente como final.mp4');
+      console.log('📁 Vídeo processado salvo localmente como final.mp4');
     }
 
-    if (fs.existsSync(original)) fs.unlinkSync(original);
-    if (fs.existsSync(final)) fs.unlinkSync(final);
+    fs.unlinkSync(original);
+    fs.unlinkSync(final);
   } catch (e) {
     console.error('❌ Erro:', e.message || e);
   }
