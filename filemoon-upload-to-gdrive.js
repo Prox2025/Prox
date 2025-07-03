@@ -13,6 +13,7 @@ const DESTINO = process.argv[5] || 'drive';
 const SERVER_URL = 'https://livestream.ct.ws/M/upload.php';
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
+// Obtém as credenciais e pasta do servidor
 async function getGoogleDriveCredentials() {
   const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
   const page = await browser.newPage();
@@ -134,10 +135,10 @@ function reencode(input, output) {
   if (result.status !== 0) throw new Error('Erro ao reencodar vídeo.');
 }
 
-async function uploadToDrive(filePath, nome, token, folderId, chave) {
+// NOVA função para gerar a URL de upload
+async function criarUploadUrl(token, nome, folderId) {
   const meta = JSON.stringify({ name: nome, parents: [folderId] });
-
-  let uploadUrl = await new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const req = https.request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
       method: 'POST',
       headers: {
@@ -155,6 +156,11 @@ async function uploadToDrive(filePath, nome, token, folderId, chave) {
     req.on('error', reject);
     req.write(meta); req.end();
   });
+}
+
+async function uploadToDrive(filePath, nome, token, folderId, chave) {
+  let tokenAtual = token;
+  let uploadUrl = await criarUploadUrl(tokenAtual, nome, folderId);
 
   const CHUNK = 256 * 1024 * 1024;
   const size = fs.statSync(filePath).size;
@@ -171,26 +177,24 @@ async function uploadToDrive(filePath, nome, token, folderId, chave) {
 
     while (!success && attempts < 3) {
       try {
-        console.log(`📤 Enviando chunk: ${offset}-${offset + chunkSize - 1}/${size} (Tentativa ${attempts + 1})`);
+        console.log(`📤 Enviando pedaço: ${offset}-${offset + chunkSize - 1}/${size} (Tentativa ${attempts + 1})`);
 
         await new Promise((resolve, reject) => {
           const req = https.request(uploadUrl, {
             method: 'PUT',
             headers: {
-              'Authorization': `Bearer ${token}`,
+              'Authorization': `Bearer ${tokenAtual}`,
               'Content-Length': chunkSize,
               'Content-Range': `bytes ${offset}-${offset + chunkSize - 1}/${size}`
             }
           }, res => {
-            if ([200, 201, 308].includes(res.statusCode)) {
-              resolve();
-            } else if ([401, 403].includes(res.statusCode)) {
+            if ([200, 201, 308].includes(res.statusCode)) resolve();
+            else if ([401, 403].includes(res.statusCode)) {
               reject(new Error(`Token expirado ou inválido (HTTP ${res.statusCode})`));
             } else {
               reject(new Error(`Erro HTTP ${res.statusCode}`));
             }
           });
-
           req.on('error', reject);
           req.write(buffer); req.end();
         });
@@ -200,26 +204,9 @@ async function uploadToDrive(filePath, nome, token, folderId, chave) {
         console.warn(`⚠️ Falha ao enviar chunk: ${err.message}`);
         attempts++;
         if (err.message.includes('Token expirado') && attempts < 3) {
-          console.log('🔄 Renovando token...');
-          token = await generateGoogleDriveToken(chave);
-          uploadUrl = await new Promise((resolve, reject) => {
-            const req = https.request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json; charset=UTF-8',
-                'Content-Length': Buffer.byteLength(meta)
-              }
-            }, res => {
-              if (![200, 201].includes(res.statusCode)) {
-                reject(new Error(`Erro ao reiniciar upload resumido. Status: ${res.statusCode}`));
-              } else {
-                resolve(res.headers.location);
-              }
-            });
-            req.on('error', reject);
-            req.write(meta); req.end();
-          });
+          console.log('🔄 Renovando token e URL...');
+          tokenAtual = await generateGoogleDriveToken(chave);
+          uploadUrl = await criarUploadUrl(tokenAtual, nome, folderId);
         }
         if (attempts >= 3) throw new Error('Erro ao enviar chunk após 3 tentativas.');
         await delay(2000);
@@ -232,6 +219,7 @@ async function uploadToDrive(filePath, nome, token, folderId, chave) {
   fs.closeSync(fd);
 }
 
+// EXECUÇÃO PRINCIPAL
 (async () => {
   try {
     if (!VIDEO_URL) throw new Error('Informe o link do vídeo.');
