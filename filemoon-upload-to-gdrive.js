@@ -2,7 +2,6 @@ const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 const VIDEO_URL = process.argv[2];
@@ -13,7 +12,7 @@ const DESTINO = process.argv[5] || 'drive';
 const SERVER_URL = 'https://livestream.ct.ws/M/upload.php';
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-async function getGoogleDriveCredentials() {
+async function getCredentials() {
   console.log('🌐 Acessando servidor para obter credenciais...');
   const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
   const page = await browser.newPage();
@@ -23,9 +22,8 @@ async function getGoogleDriveCredentials() {
     try { return JSON.parse(document.body.innerText); } catch { return null; }
   });
   await browser.close();
-  console.log('📦 Dados recebidos do servidor:', json);
-  if (!json || !json.chave || !json.pastaDriveId) throw new Error('Credenciais inválidas');
-  return json;
+  if (!json || !json.rclone || !json.rclone.access_token) throw new Error('Credenciais inválidas');
+  return json.rclone;
 }
 
 function isYtOrFb(url) {
@@ -36,7 +34,9 @@ function downloadFromYtOrFb(url, outputPath) {
   console.log('📥 Baixando de YouTube/Facebook...');
   const args = ['-f', 'best[ext=mp4]', url, '-o', outputPath];
   const result = spawnSync('yt-dlp', args, { stdio: 'inherit' });
-  if (result.status !== 0) throw new Error('Erro no yt-dlp');
+  if (result.status !== 0) {
+    throw new Error('Erro no yt-dlp');
+  }
 }
 
 async function getVideoUrlFromFilemoon(url) {
@@ -74,51 +74,6 @@ async function getVideoUrlFromFilemoon(url) {
   return videoUrls[0];
 }
 
-async function generateGoogleDriveToken(chave) {
-  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
-  const now = Math.floor(Date.now() / 1000);
-  const claim = Buffer.from(JSON.stringify({
-    iss: chave.client_email,
-    scope: 'https://www.googleapis.com/auth/drive.file',
-    aud: chave.token_uri,
-    exp: now + 3600,
-    iat: now
-  })).toString('base64url');
-  const signer = crypto.createSign('RSA-SHA256');
-  signer.update(`${header}.${claim}`);
-  const signature = signer.sign(chave.private_key, 'base64url');
-  const jwt = `${header}.${claim}.${signature}`;
-
-  return new Promise((resolve, reject) => {
-    const data = new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: jwt
-    }).toString();
-
-    const req = https.request(chave.token_uri, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': data.length
-      }
-    }, res => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(body);
-          if (json.access_token) resolve(json.access_token);
-          else reject(new Error(body));
-        } catch { reject(new Error('Erro ao gerar token')); }
-      });
-    });
-
-    req.on('error', reject);
-    req.write(data);
-    req.end();
-  });
-}
-
 function reencode(input, output) {
   const args = ['-i', input];
   if (START_TIME && START_TIME !== '00:00:00') args.push('-ss', START_TIME);
@@ -137,86 +92,111 @@ function reencode(input, output) {
   if (result.status !== 0) throw new Error('Erro ao reencodar vídeo.');
 }
 
-async function createUploadUrl(nome, token, folderId) {
-  const meta = JSON.stringify({ name: nome, parents: [folderId] });
+async function refreshAccessToken(rclone) {
+  console.log('🔄 Renovando access_token...');
+  const data = new URLSearchParams({
+    client_id: rclone.client_id,
+    client_secret: rclone.client_secret,
+    refresh_token: rclone.refresh_token,
+    grant_type: 'refresh_token'
+  }).toString();
 
   return new Promise((resolve, reject) => {
-    const req = https.request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+    const req = https.request('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json; charset=UTF-8',
-        'Content-Length': Buffer.byteLength(meta)
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': data.length
       }
     }, res => {
-      if (![200, 201].includes(res.statusCode)) {
-        res.setEncoding('utf8');
-        let body = '';
-        res.on('data', chunk => body += chunk);
-        res.on('end', () => {
-          reject(new Error(`Erro ao criar URL de upload: ${res.statusCode} ${body}`));
-        });
-      } else {
-        resolve(res.headers.location);
-      }
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body);
+          if (json.access_token) resolve(json.access_token);
+          else reject(new Error('Falha ao renovar token: ' + body));
+        } catch (e) {
+          reject(e);
+        }
+      });
     });
     req.on('error', reject);
-    req.write(meta);
+    req.write(data);
     req.end();
   });
 }
 
-async function uploadToDrive(filePath, nome, chave, folderId) {
-  const CHUNK = 256 * 1024 * 1024;
-  const size = fs.statSync(filePath).size;
-  const fd = fs.openSync(filePath, 'r');
-  let offset = 0;
-  let token = await generateGoogleDriveToken(chave);
-  let uploadUrl = await createUploadUrl(nome, token, folderId);
+async function uploadToDrive(filePath, fileName, rclone, folderId) {
+  let accessToken = rclone.access_token;
 
-  for (let tentativa = 1; tentativa <= 3; tentativa++) {
-    try {
-      const chunkSize = size - offset;
-      const buffer = Buffer.alloc(chunkSize);
-      fs.readSync(fd, buffer, 0, chunkSize, offset);
-      await new Promise((resolve, reject) => {
-        const req = https.request(uploadUrl, {
-          method: 'PUT',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Length': chunkSize,
-            'Content-Range': `bytes ${offset}-${offset + chunkSize - 1}/${size}`
-          }
-        }, res => {
-          if ([200, 201, 308].includes(res.statusCode)) resolve();
-          else reject(new Error(`Erro ao enviar chunk: ${res.statusCode}`));
+  // Verifica se token é válido, senão renova (pode implementar lógica mais robusta aqui)
+  // Aqui vamos tentar usar e renovar só em erro, para simplificar.
+
+  const metadata = JSON.stringify({ name: fileName, parents: [folderId] });
+  const fileData = fs.readFileSync(filePath);
+  const boundary = '-------314159265358979323846';
+  const delimiter = `\r\n--${boundary}\r\n`;
+  const closeDelimiter = `\r\n--${boundary}--`;
+
+  const contentType = 'video/mp4';
+
+  const body =
+    delimiter +
+    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+    metadata +
+    delimiter +
+    `Content-Type: ${contentType}\r\n\r\n` +
+    fileData +
+    closeDelimiter;
+
+  async function sendRequest(token) {
+    return new Promise((resolve, reject) => {
+      const options = {
+        method: 'POST',
+        hostname: 'www.googleapis.com',
+        path: '/upload/drive/v3/files?uploadType=multipart',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': `multipart/related; boundary=${boundary}`
+        }
+      };
+      const req = https.request(options, res => {
+        let resData = '';
+        res.on('data', chunk => resData += chunk);
+        res.on('end', () => {
+          if (res.statusCode === 401) reject(new Error('Unauthorized'));
+          else if (res.statusCode >= 200 && res.statusCode < 300) resolve(resData);
+          else reject(new Error(`HTTP ${res.statusCode}: ${resData}`));
         });
-        req.on('error', reject);
-        req.write(buffer);
-        req.end();
       });
-      break;
-    } catch (e) {
-      console.warn(`⚠️ Falha ao enviar chunk: ${e.message}`);
-      if (tentativa < 3) {
-        console.log('🔄 Renovando token e URL de upload...');
-        await delay(3000);
-        token = await generateGoogleDriveToken(chave);
-        uploadUrl = await createUploadUrl(nome, token, folderId);
-      } else {
-        throw new Error('❌ Falha após 3 tentativas de envio do chunk.');
-      }
-    }
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
   }
 
-  fs.closeSync(fd);
+  try {
+    const res = await sendRequest(accessToken);
+    return JSON.parse(res);
+  } catch (err) {
+    if (err.message === 'Unauthorized') {
+      // Tentar renovar token
+      accessToken = await refreshAccessToken(rclone);
+      const res = await sendRequest(accessToken);
+      return JSON.parse(res);
+    }
+    throw err;
+  }
 }
 
 (async () => {
   try {
     if (!VIDEO_URL) throw new Error('Informe o link do vídeo.');
 
-    const { chave, pastaDriveId } = await getGoogleDriveCredentials();
+    const rclone = await getCredentials();
+    const pastaDriveId = rclone.folderId || '1Fbvv0QvJSesaMcByxH3y8GaG_Jy-kBmC';
+
     const original = path.join(__dirname, 'original.mp4');
     const final = path.join(__dirname, 'final.mp4');
 
@@ -233,8 +213,8 @@ async function uploadToDrive(filePath, nome, chave, folderId) {
 
     if (DESTINO === 'drive') {
       const nome = `video_240p_${Date.now()}.mp4`;
-      await uploadToDrive(final, nome, chave, pastaDriveId);
-      console.log(`✅ Enviado para Google Drive como: ${nome}`);
+      const uploadRes = await uploadToDrive(final, nome, rclone, pastaDriveId);
+      console.log('✅ Upload concluído:', uploadRes);
     } else {
       console.log('📁 Vídeo salvo localmente como final.mp4');
     }
@@ -243,5 +223,6 @@ async function uploadToDrive(filePath, nome, chave, folderId) {
     fs.unlinkSync(final);
   } catch (e) {
     console.error('❌ Erro:', e.message || e);
+    process.exit(1);
   }
 })();
