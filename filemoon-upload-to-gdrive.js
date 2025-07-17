@@ -2,7 +2,6 @@ const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 const VIDEO_URL = process.argv[2];
@@ -38,15 +37,6 @@ async function getGoogleDriveCredentials() {
   return { chave, pastaDriveId: raw.pastaDriveId };
 }
 
-function reencode(input, output) {
-  const args = ['-i', input];
-  if (START_TIME && START_TIME !== '00:00:00') args.push('-ss', START_TIME);
-  if (END_TIME && END_TIME !== '00:00:00' && END_TIME !== START_TIME) args.push('-to', END_TIME);
-  args.push('-vf', 'scale=-2:240', '-c:v', 'libx264', '-preset', 'fast', '-b:v', '500k', '-c:a', 'aac', '-b:a', '64k', '-y', output);
-  const result = spawnSync('ffmpeg', args, { stdio: 'inherit' });
-  if (result.status !== 0) throw new Error('Erro ao reencodar vídeo.');
-}
-
 async function getVideoUrlFromFilemoon(url) {
   const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
   const page = await browser.newPage();
@@ -80,6 +70,15 @@ async function getVideoUrlFromFilemoon(url) {
   await browser.close();
   if (videoUrls.length === 0) throw new Error('Nenhuma URL encontrada.');
   return videoUrls[0];
+}
+
+function reencode(input, output) {
+  const args = ['-i', input];
+  if (START_TIME && START_TIME !== '00:00:00') args.push('-ss', START_TIME);
+  if (END_TIME && END_TIME !== '00:00:00' && END_TIME !== START_TIME) args.push('-to', END_TIME);
+  args.push('-vf', 'scale=-2:240', '-c:v', 'libx264', '-preset', 'fast', '-b:v', '500k', '-c:a', 'aac', '-b:a', '64k', '-y', output);
+  const result = spawnSync('ffmpeg', args, { stdio: 'inherit' });
+  if (result.status !== 0) throw new Error('Erro ao reencodar vídeo.');
 }
 
 async function refreshAccessToken(chave) {
@@ -171,19 +170,35 @@ async function uploadToDrive(filePath, nome, chave, folderId) {
   console.log('✅ Upload finalizado!');
 }
 
+async function baixarVideo(url, outputPath) {
+  if (url.includes('youtube.com') || url.includes('youtu.be') || url.includes('facebook.com')) {
+    console.log('🎬 Detectado YouTube ou Facebook, baixando com yt-dlp...');
+    const result = spawnSync('yt-dlp', ['-o', outputPath, url], { stdio: 'inherit' });
+    if (result.status !== 0) throw new Error('Erro ao baixar vídeo com yt-dlp.');
+  } else if (url.includes('filemoon')) {
+    console.log('🎬 Detectado Filemoon, usando método próprio...');
+    const videoUrl = await getVideoUrlFromFilemoon(url);
+    console.log('🎯 Link direto do vídeo:', videoUrl);
+    const result = spawnSync('ffmpeg', ['-i', videoUrl, '-c', 'copy', '-y', outputPath], { stdio: 'inherit' });
+    if (result.status !== 0) throw new Error('Erro ao baixar vídeo do Filemoon.');
+  } else {
+    throw new Error('Plataforma não suportada.');
+  }
+}
+
 (async () => {
   try {
     if (!VIDEO_URL) throw new Error('Informe o link do vídeo.');
 
     const { chave, pastaDriveId } = await getGoogleDriveCredentials();
+
     const original = path.join(__dirname, 'original.mp4');
     const final = path.join(__dirname, 'final.mp4');
 
-    const videoUrl = await getVideoUrlFromFilemoon(VIDEO_URL);
-    console.log('🎯 Link direto do vídeo:', videoUrl);
-    spawnSync('ffmpeg', ['-i', videoUrl, '-c', 'copy', '-y', original], { stdio: 'inherit' });
+    await baixarVideo(VIDEO_URL, original);
 
     if (!fs.existsSync(original)) throw new Error('Erro ao baixar vídeo.');
+
     reencode(original, final);
 
     if (DESTINO === 'drive') {
